@@ -1,0 +1,11 @@
+{
+  "name": "Remix ScreenMind2 Ultra",
+  "description": "Локальная база знаний v1.0 с ИИ-аналитикой и умным разделением текстов.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
