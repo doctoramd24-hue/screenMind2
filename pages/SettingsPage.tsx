@@ -3,11 +3,13 @@ import React, { useState, useCallback, memo, useEffect, useRef } from 'react';
 import { useNotes } from '../contexts/NotesContext.tsx';
 import { AIProvider } from '../types.ts';
 import { 
-  Settings as SettingsIcon, Terminal, RefreshCw, Download, Database, Zap, Cpu, KeyRound, Mic, Bot, ScanLine, Send, Info, Eye, EyeOff, CheckCircle2, AlertCircle, Loader2, Save, Users, Activity, HardDrive, Trash2, Scissors, UploadCloud, ShieldCheck, FileText
+  Settings as SettingsIcon, Terminal, RefreshCw, Download, Database, Zap, Cpu, KeyRound, Mic, Bot, ScanLine, Send, Info, Eye, EyeOff, CheckCircle2, AlertCircle, Loader2, Save, Users, Activity, HardDrive, Trash2, Scissors, UploadCloud, ShieldCheck, FileText, Smartphone
 } from 'lucide-react';
 import * as storage from '../utils/storage.ts';
 import * as ai from '../utils/aiAdapter.ts';
 import { motion, AnimatePresence } from 'motion/react';
+import { MobileLocalModelsSection } from '../components/MobileLocalModelsSection.tsx';
+import { OfflineRAGAndSyncSection } from '../components/OfflineRAGAndSyncSection.tsx';
 
 // Provider Selector Component
 const ProviderSelector = memo(({ 
@@ -198,6 +200,25 @@ const ProviderSelector = memo(({
                 onChange={e => onModelChange(e.target.value)}
                 placeholder={getModelPlaceholder()}
               />
+              {/* Quick Model Badges for Local / Mobile */}
+              {isOllama && (
+                <div className="flex flex-wrap gap-1.5 pt-1 px-1">
+                  {['qwen2.5:0.5b', 'qwen2.5:1.5b', 'llama3.2:1b', 'deepseek-r1:1.5b', 'smollm2:1.7b'].map(m => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => onModelChange(m)}
+                      className={`text-[9px] font-mono px-2 py-0.5 rounded-md transition-colors ${
+                        model === m 
+                          ? 'bg-blue-600 text-white font-bold' 
+                          : 'bg-gray-100 hover:bg-gray-200 dark:bg-slate-800 dark:text-slate-300'
+                      }`}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              )}
           </div>
           {(!isOllama) && (
             <div className="space-y-2 relative">
@@ -317,7 +338,20 @@ const SettingsPage: React.FC = () => {
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-8">
           <div className="col-span-1 xl:col-span-2 space-y-8">
-            <h2 className="text-2xl font-black dark:text-white px-4">AI Modules</h2>
+            {/* Mobile & Local Model Hub */}
+            <MobileLocalModelsSection
+              localSettings={localSettings}
+              onUpdateSetting={updateLocalField}
+              onApplyPreset={(updates) => {
+                setLocalSettings(prev => ({ ...prev, ...updates }));
+              }}
+              onLog={(level, msg) => addLog(level, msg)}
+            />
+
+            {/* Offline RAG, Graph Resolution & E2EE Sync Section */}
+            <OfflineRAGAndSyncSection />
+
+            <h2 className="text-2xl font-black dark:text-white px-4">AI Modules (Распределение задач)</h2>
             
             <ProviderSelector 
                 label="Brain (Analyzer & Chat)" icon={Cpu}

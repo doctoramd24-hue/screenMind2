@@ -1,6 +1,7 @@
 
 import { get, set, del } from 'idb-keyval';
 import { Note, Settings, AIProvider, Goal, AIProfile, BackupMetadata } from '../types.ts';
+import { cryptoLayer } from './cryptoLayer.ts';
 
 const NOTES_KEY = 'screenmind_notes';
 const SETTINGS_KEY = 'screenmind_settings';
@@ -9,21 +10,36 @@ const GOALS_KEY = 'screenmind_goals';
 const BACKUPS_PREFIX = 'screenmind_backup_';
 
 export const saveNotes = async (notes: Note[]) => {
-  await set(NOTES_KEY, notes);
+  const payload = await cryptoLayer.encrypt(notes);
+  await set(NOTES_KEY, payload);
 };
 
 export const getNotes = async (): Promise<Note[]> => {
-  const notes = await get(NOTES_KEY);
-  return notes || [];
+  const raw = await get(NOTES_KEY);
+  if (!raw) return [];
+
+  const res = await cryptoLayer.decrypt<Note[]>(raw);
+  if (res.wasEncrypted && res.error) {
+    console.warn('[Storage] Notes are encrypted and locked:', res.error);
+    return [];
+  }
+  return res.data || [];
 };
 
 export const saveGoals = async (goals: Goal[]) => {
-  await set(GOALS_KEY, goals);
+  const payload = await cryptoLayer.encrypt(goals);
+  await set(GOALS_KEY, payload);
 };
 
 export const getGoals = async (): Promise<Goal[]> => {
-  const goals = await get(GOALS_KEY);
-  return goals || [];
+  const raw = await get(GOALS_KEY);
+  if (!raw) return [];
+
+  const res = await cryptoLayer.decrypt<Goal[]>(raw);
+  if (res.wasEncrypted && res.error) {
+    return [];
+  }
+  return res.data || [];
 };
 
 export const saveSettings = async (settings: Settings) => {

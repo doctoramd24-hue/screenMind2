@@ -25,6 +25,7 @@ export interface Note {
   extracted_links?: string[];
   related_nodes?: string[];
   action_items?: string[];
+  vector?: number[]; // 384-dimensional dense semantic embedding for Offline RAG
   createdAt: string;
   updatedAt: string;
   status: NoteStatus;
@@ -81,6 +82,50 @@ export interface Settings {
   // Cache
   cacheEnabled: boolean;
   cacheTTL: number; // in minutes
+
+  // Local & Mobile Custom Models Library
+  customLocalModels?: CustomLocalModel[];
+
+  // Graph Entity Resolution (Auto-merging synonyms)
+  entityResolutionEnabled?: boolean;
+  entityResolutionThreshold?: number; // 0.75 - 0.95
+
+  // E2EE Confidential Cloud Sync (WebDAV / Remote Vault)
+  e2eeSyncEnabled?: boolean;
+  e2eeSyncUrl?: string; // e.g. https://nextcloud.example.com/remote.php/webdav/screenmind_vault.enc
+  e2eeSyncUsername?: string;
+  e2eeSyncPassword?: string;
+  e2eePassphrase?: string;
+  lastE2EESync?: string;
+}
+
+export interface GraphMergeReport {
+  totalMerged: number;
+  mergedNodes: { from: string; to: string; similarity: number }[];
+  mergedTags: { from: string; to: string; similarity: number }[];
+  affectedNotesCount: number;
+}
+
+export interface EncryptedVaultPayload {
+  version: string;
+  timestamp: string;
+  salt: string; // Base64
+  iv: string;   // Base64
+  ciphertext: string; // Base64 AES-GCM
+  noteCount: number;
+}
+
+export interface CustomLocalModel {
+  id: string;
+  name: string;
+  provider: AIProvider;
+  url: string;
+  model: string;
+  apiKey?: string;
+  description?: string;
+  deviceType?: 'phone_termux' | 'phone_llamacpp' | 'local_wifi' | 'custom_api';
+  contextSize?: number;
+  addedAt?: string;
 }
 
 export enum AIProvider {

@@ -8,6 +8,7 @@ import { LocalVectorDB } from './vectorDb.ts';
 import { SemanticCache } from './semanticCache.ts';
 import { LLMOpsService, PromptFirewall } from './llmOps.ts';
 import { getSystemToolsPrompt } from './functionRegistry.ts';
+import { cleanOcrText, getExistingTagsAndNodes } from './textCleaner.ts';
 
 // ============================================================================
 // 1. SYSTEM METRICS & CACHE SERVICES (SINGLETONS)
@@ -126,37 +127,16 @@ export const clearCache = () => CacheService.getInstance().clear();
 // 2. MARKDOWN & XML CONTEXT HELPERS & STRUCTURED OUTPUT REPAIR
 // ============================================================================
 
+import { safeParseJSON } from './jsonRepair.ts';
+
 export const extractJSON = (str: string): any => {
   if (!str) return {};
-  
-  // Extract think block if present (DeepSeek / Qwen / Reasoning models)
-  let clean = str.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  
-  // Clean markdown codeblocks
-  clean = clean.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/g, '').trim();
-  
-  try {
-    return JSON.parse(clean);
-  } catch (e) {
-    // Regex fallback to find bracketed JSON
-    const jsonRegex = /\{[\s\S]*\}|\[[\s\S]*\]/;
-    const match = clean.match(jsonRegex);
-    if (match) {
-      try {
-        return JSON.parse(match[0].trim());
-      } catch (inner) {
-        // Try fixing common trailing comma or unescaped newline issues
-        try {
-          const repaired = match[0]
-            .replace(/,\s*([}\]])/g, '$1')
-            .replace(/[\u0000-\u001F]+/g, ' ');
-          return JSON.parse(repaired);
-        } catch (_) {}
-      }
-    }
-    console.warn("AI Adapter: Failed to parse JSON", clean.slice(0, 100));
-    return {};
+  const result = safeParseJSON(str);
+  if (result.success && result.data) {
+    return result.data;
   }
+  console.warn("AI Adapter: Failed to parse JSON even with jsonrepair", str.slice(0, 100));
+  return {};
 };
 
 /**
@@ -881,11 +861,42 @@ async function callAI(
   };
 
   const response = await llmService.execute(req, config, settingsContext);
-  return isJson ? extractJSON(response.text) : response.text;
+  if (!isJson) return response.text;
+
+  const parsed = safeParseJSON(response.text);
+  if (parsed.success && parsed.data) {
+    return parsed.data;
+  }
+
+  // LLMOps Retry Mechanism: Auto retry with micro-prompt if JSON is broken and cannot be repaired
+  try {
+    const repairPrompt = `Ты вернул некорректный синтаксис JSON. Исправь его и верни ТОЛЬКО строго валидный JSON без markdown:\n\n${response.text.slice(0, 3000)}`;
+    const retryReq: LLMRequest = {
+      messages: [{ role: 'user', content: repairPrompt }],
+      systemInstruction: 'You are a JSON repair validator. Return only pure raw JSON.',
+      isJson: true
+    };
+    const retryRes = await llmService.execute(retryReq, config, settingsContext);
+    const secondAttempt = safeParseJSON(retryRes.text);
+    if (secondAttempt.success && secondAttempt.data) {
+      return secondAttempt.data;
+    }
+  } catch (_) {}
+
+  return parsed.data || {};
 }
 
-export const analyzeText = async (text: string, settings: Settings): Promise<StructuredKnowledgeOutput> => {
+export const analyzeText = async (text: string, settings: Settings, existingNotes?: Note[]): Promise<StructuredKnowledgeOutput> => {
+  const cleanedText = cleanOcrText(text);
+  const meta = getExistingTagsAndNodes(existingNotes || [], 100);
+  const metaTagsStr = meta.tags.length > 0 ? meta.tags.join(', ') : 'нет';
+  const metaNodesStr = meta.nodes.length > 0 ? meta.nodes.join(', ') : 'нет';
+
   const systemInstruction = `Вы — ядро базы знаний ScreenMind. Ваша задача — проанализировать входящий текст (или OCR-текст скриншота) и превратить его в структурированную единицу знаний для графа.
+
+Пытайся связать запись с уже СУЩЕСТВУЮЩИМИ узлами и тегами, если они подходят по смыслу (не создавай лишних синонимов).
+Существующие теги: [${metaTagsStr}]
+Существующие узлы графа: [${metaNodesStr}]
 
 Вы должны вернуть ответ строго в формате JSON, без какого-либо лишнего текста, без markdown-разметки типа \`\`\`json.
 
@@ -893,14 +904,14 @@ export const analyzeText = async (text: string, settings: Settings): Promise<Str
 {
   "title": "Короткий, емкий заголовок (до 5-7 слов)",
   "summary": "Главная суть текста в 1-2 предложениях",
-  "hashtags": ["тег1", "тег2", "тег3"],
-  "extracted_links": ["https://ссылка1", "https://ссылка2"],
+  "hashtags": ["тег1", "тег2"],
+  "extracted_links": ["https://ссылка1"],
   "related_nodes": ["Ключевая концепция 1", "Ключевая концепция 2"],
-  "action_items": ["Действие 1, если есть", "Действие 2"]
+  "action_items": ["Действие 1, если есть"]
 }`;
 
   const prompt = `Проанализируйте входящий текст и верните строго JSON по указанной схеме:
-${wrapInXmlTag('input_text', text.slice(0, 8000))}
+${wrapInXmlTag('input_text', cleanedText.slice(0, 8000))}
 
 Строгий JSON-ответ:`;
 
@@ -1136,7 +1147,7 @@ export const chatWithAgent = async (
 
 export const performOCR = async (base64Data: string, mimeType: string, settings: Settings) => {
   const dataOnly = base64Data.split(',')[1] || base64Data;
-  return await callAI(
+  const rawText = await callAI(
     "Perform optical character recognition (OCR) on this image. Extract all text preserving headings, tables and lists in Markdown format.",
     settings.ocrProvider,
     settings.ocrModel,
@@ -1147,6 +1158,7 @@ export const performOCR = async (base64Data: string, mimeType: string, settings:
     { data: dataOnly, mimeType },
     settings
   );
+  return cleanOcrText(rawText);
 };
 
 export const semanticSearch = async (query: string, notes: Note[], settings: Settings) => {

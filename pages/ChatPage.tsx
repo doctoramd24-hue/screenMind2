@@ -2,21 +2,23 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useNotes } from '../contexts/NotesContext.tsx';
 import { 
   Send, Bot, User, Eraser, AlertCircle, Sparkles, 
-  Cpu, ChevronDown, ChevronUp, Copy, Check, Activity, Database, Zap 
+  Cpu, ChevronDown, ChevronUp, Copy, Check, Activity, Database, Zap, Smartphone
 } from 'lucide-react';
 import * as ai from '../utils/aiAdapter.ts';
-import { ChatMessage } from '../types.ts';
+import { ChatMessage, AIProvider } from '../types.ts';
 import { LLMOpsDrawer } from '../components/LLMOpsDrawer.tsx';
+import { RECOMMENDED_MOBILE_MODELS } from '../utils/localModelManager.ts';
 import { motion, AnimatePresence } from 'motion/react';
 
 const ChatPage: React.FC = () => {
-  const { notes, settings, setSelectedNoteId } = useNotes();
+  const { notes, settings, updateSettings, setSelectedNoteId } = useNotes();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [isLLMOpsOpen, setIsLLMOpsOpen] = useState(false);
+  const [showModelPicker, setShowModelPicker] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Sync vector database on load
@@ -95,13 +97,110 @@ const ChatPage: React.FC = () => {
             <h2 className="text-xl md:text-2xl font-black tracking-tight dark:text-white flex items-center gap-2">
               Offline RAG Чат
             </h2>
-            <div className="flex items-center gap-2 mt-0.5">
-              <span className="text-[10px] font-black uppercase tracking-wider text-blue-600 bg-blue-50 dark:bg-blue-900/30 px-2.5 py-0.5 rounded-md flex items-center gap-1">
+            <div className="relative flex items-center gap-2 mt-0.5">
+              <button
+                onClick={() => setShowModelPicker(!showModelPicker)}
+                className="text-[10px] font-black uppercase tracking-wider text-blue-600 hover:text-blue-700 bg-blue-50 hover:bg-blue-100 dark:bg-blue-900/30 dark:hover:bg-blue-900/50 px-2.5 py-0.5 rounded-md flex items-center gap-1.5 transition-colors cursor-pointer"
+                title="Сменить модель"
+              >
                 <Cpu size={10} /> {settings.provider} ({settings.model || 'Auto'})
-              </span>
+                <ChevronDown size={10} />
+              </button>
               <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded flex items-center gap-1">
                 <Database size={10} /> {vectorStats.totalChunks} векторов
               </span>
+
+              {/* Quick Model Selector Dropdown */}
+              <AnimatePresence>
+                {showModelPicker && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                    className="absolute top-full left-0 mt-2 w-72 bg-white dark:bg-slate-900 rounded-2xl shadow-xl border border-slate-200 dark:border-slate-800 p-3 z-50 space-y-2"
+                  >
+                    <div className="flex items-center justify-between px-1 pb-1 border-b border-slate-100 dark:border-slate-800">
+                      <span className="text-[10px] font-black uppercase text-slate-400">Быстрый выбор модели</span>
+                      <Smartphone size={12} className="text-blue-500" />
+                    </div>
+
+                    <div className="space-y-1 max-h-56 overflow-y-auto custom-scrollbar">
+                      {/* Presets */}
+                      <div className="text-[8px] font-black uppercase text-slate-400 px-1 pt-1">Мобильные / Локальные:</div>
+                      {RECOMMENDED_MOBILE_MODELS.slice(0, 5).map(m => (
+                        <button
+                          key={m.id}
+                          onClick={() => {
+                            updateSettings({
+                              provider: m.provider,
+                              url: m.url,
+                              model: m.model
+                            });
+                            setShowModelPicker(false);
+                          }}
+                          className={`w-full text-left p-2 rounded-xl text-xs transition-colors flex items-center justify-between ${
+                            settings.model === m.model ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 font-bold' : 'hover:bg-slate-50 dark:hover:bg-slate-800'
+                          }`}
+                        >
+                          <div>
+                            <div className="font-bold text-[11px] dark:text-white">{m.name}</div>
+                            <div className="text-[9px] font-mono text-slate-400">{m.ramUsage}</div>
+                          </div>
+                          {settings.model === m.model && <Check size={14} className="text-blue-600" />}
+                        </button>
+                      ))}
+
+                      {/* Saved custom models if any */}
+                      {(settings.customLocalModels || []).length > 0 && (
+                        <>
+                          <div className="text-[8px] font-black uppercase text-slate-400 px-1 pt-2 border-t border-slate-100 dark:border-slate-800">Сохраненные:</div>
+                          {(settings.customLocalModels || []).map(m => (
+                            <button
+                              key={m.id}
+                              onClick={() => {
+                                updateSettings({
+                                  provider: m.provider,
+                                  url: m.url,
+                                  model: m.model,
+                                  apiKey: m.apiKey || ''
+                                });
+                                setShowModelPicker(false);
+                              }}
+                              className={`w-full text-left p-2 rounded-xl text-xs transition-colors flex items-center justify-between ${
+                                settings.model === m.model ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 font-bold' : 'hover:bg-slate-50 dark:hover:bg-slate-800'
+                              }`}
+                            >
+                              <div>
+                                <div className="font-bold text-[11px] dark:text-white">{m.name}</div>
+                                <div className="text-[9px] font-mono text-slate-400">{m.model}</div>
+                              </div>
+                              {settings.model === m.model && <Check size={14} className="text-blue-600" />}
+                            </button>
+                          ))}
+                        </>
+                      )}
+
+                      {/* Gemini default */}
+                      <div className="text-[8px] font-black uppercase text-slate-400 px-1 pt-2 border-t border-slate-100 dark:border-slate-800">Облачные:</div>
+                      <button
+                        onClick={() => {
+                          updateSettings({
+                            provider: AIProvider.Gemini,
+                            model: 'gemini-2.5-flash'
+                          });
+                          setShowModelPicker(false);
+                        }}
+                        className={`w-full text-left p-2 rounded-xl text-xs transition-colors flex items-center justify-between ${
+                          settings.provider === AIProvider.Gemini ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 font-bold' : 'hover:bg-slate-50 dark:hover:bg-slate-800'
+                        }`}
+                      >
+                        <div className="font-bold text-[11px] dark:text-white">Google Gemini 2.5 Flash</div>
+                        {settings.provider === AIProvider.Gemini && <Check size={14} className="text-blue-600" />}
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
           </div>
         </div>

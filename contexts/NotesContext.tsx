@@ -1,8 +1,12 @@
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { Note, Settings, AIProvider, AppLog, NoteStatus, Goal, AIProfile, AIMetrics } from '../types.ts';
+import { Note, Settings, AIProvider, AppLog, NoteStatus, Goal, AIProfile, AIMetrics, GraphMergeReport } from '../types.ts';
 import * as storage from '../utils/storage.ts';
 import * as ai from '../utils/aiAdapter.ts';
+import { cleanOcrText, checkSemanticCache } from '../utils/textCleaner.ts';
+import { resolveEntityList, autoMergeGraph } from '../utils/graphMerger.ts';
+import { exportEncryptedVaultFile, importEncryptedVaultFile, saveLocalEncryptedSnapshot } from '../utils/encryptionSync.ts';
+import { generateLocalEmbedding } from '../utils/vectorDb.ts';
 
 interface NotesContextType {
   notes: Note[];
@@ -45,15 +49,19 @@ interface NotesContextType {
   deleteCategory: (name: string) => Promise<void>;
   // Ideas Grouping
   autoGroupIdeas: () => Promise<void>;
+  // Graph Entity Resolution
+  runGraphAutoMerge: () => Promise<GraphMergeReport>;
   // Profiles
   createProfile: (name: string) => Promise<void>;
   switchProfile: (id: string) => Promise<void>;
   deleteProfile: (id: string) => Promise<void>;
-  // Cache & Backup
+  // Cache & Backup & E2EE Sync
   clearSystemCache: () => void;
   triggerBackup: () => Promise<void>;
   importBackup: (file: File) => Promise<void>;
   exportToMarkdown: () => Promise<void>;
+  exportEncryptedVault: (passphrase: string) => Promise<void>;
+  importEncryptedVault: (file: File, passphrase: string) => Promise<void>;
 }
 
 const NotesContext = createContext<NotesContextType | undefined>(undefined);
@@ -168,6 +176,7 @@ export const NotesProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   // --- Standard Note Logic ---
   const addNote = async (content: string, title?: string, sourceType: Note['sourceType'] = 'manual', useAI = true, forceCategory?: string, audioData?: string, initialTags?: string[]) => {
+    const cleanedContent = cleanOcrText(content);
     let analysis: any = { 
       tags: [], 
       hashtags: [], 
@@ -180,19 +189,43 @@ export const NotesProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
 
     if (useAI) {
-      try { 
-        analysis = await ai.analyzeText(content, settings); 
-      } catch (e: any) { 
-        addLog('warn', 'AI Analysis skipped', e.message); 
+      // 1. Check local semantic cache before making API call
+      const cached = checkSemanticCache(cleanedContent, notes, 0.80);
+      if (cached) {
+        addLog('info', `⚡ Семантический кэш: Найдено сходство (${Math.round(cached.similarity * 100)}% с "${cached.note.title}"). Повторный запрос к API отменен.`);
+        analysis = {
+          title: title || (cached.note.title ? `${cached.note.title} (Повтор)` : 'Заметка (Повтор)'),
+          summary: cached.note.summary || '',
+          tags: cached.note.tags || cached.note.hashtags || [],
+          hashtags: cached.note.hashtags || cached.note.tags || [],
+          category: forceCategory || cached.note.category || filterCategory || 'Общее',
+          extracted_links: cached.note.extracted_links || [],
+          related_nodes: cached.note.related_nodes || [],
+          action_items: cached.note.action_items || []
+        };
+      } else {
+        try { 
+          // 2. Call AI with context truncation (aggregated tags and nodes)
+          analysis = await ai.analyzeText(cleanedContent, settings, notes); 
+        } catch (e: any) { 
+          addLog('warn', 'AI Analysis skipped', e.message); 
+        }
       }
     }
 
     // Combine initialTags and AI detected hashtags/tags
     const detectedTags = analysis.hashtags?.length ? analysis.hashtags : (analysis.tags || []);
-    const combinedTags = Array.from(new Set([...(initialTags || []), ...detectedTags]));
+    const rawTags = Array.from(new Set([...(initialTags || []), ...detectedTags]));
+
+    // Graph Entity Resolution: Resolve incoming tags and concepts against existing graph nodes
+    const existingTagsPool: string[] = Array.from(new Set<string>(notes.flatMap(n => n.tags || [])));
+    const existingNodesPool: string[] = Array.from(new Set<string>(notes.flatMap(n => n.related_nodes || [])));
+
+    const combinedTags = resolveEntityList(rawTags, existingTagsPool, 0.85);
+    const resolvedNodes = resolveEntityList(analysis.related_nodes || [], existingNodesPool, 0.85);
 
     // Find related notes based on key concepts (related_nodes), hashtags/tags, and title matches
-    const keyConcepts = (analysis.related_nodes || analysis.relatedKeywords || []).map((k: string) => k.toLowerCase());
+    const keyConcepts = (resolvedNodes.length ? resolvedNodes : (analysis.relatedKeywords || [])).map((k: string) => k.toLowerCase());
     const tags = combinedTags.map(t => t.toLowerCase());
     
     const relatedIds = notes
@@ -211,17 +244,22 @@ export const NotesProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       .slice(0, 6)
       .map(other => other.id);
 
+    // 384-dimensional dense semantic embedding for Offline RAG
+    const noteFullText = `${title || analysis.title || ''}\n\n${analysis.summary || ''}\n\n${cleanedContent}\nTags: ${combinedTags.join(', ')}`;
+    const noteVector = generateLocalEmbedding(noteFullText);
+
     const newNote: Note = {
       id: crypto.randomUUID(),
-      title: title || analysis.title || content.slice(0, 40) + "...",
-      content,
+      title: title || analysis.title || cleanedContent.slice(0, 40) + "...",
+      content: cleanedContent,
       tags: combinedTags,
       hashtags: combinedTags,
       category: forceCategory || analysis.category || filterCategory || 'Общее',
       summary: analysis.summary || '',
       extracted_links: analysis.extracted_links || [],
-      related_nodes: analysis.related_nodes || [],
+      related_nodes: resolvedNodes,
       action_items: analysis.action_items || [],
+      vector: noteVector,
       status: 'new',
       isIndexed: useAI,
       sourceType,
@@ -339,7 +377,7 @@ export const NotesProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       try {
         setIndexingProgress(Math.round((success / active.length) * 100));
         await new Promise(r => setTimeout(r, 1000));
-        const res = await ai.analyzeText(n.content, settings);
+        const res = await ai.analyzeText(n.content, settings, allNotes);
         if (res) {
           const detectedTags = res.hashtags?.length ? res.hashtags : (res.tags || []);
           const combinedTags = Array.from(new Set([...(n.tags || []), ...detectedTags]));
@@ -389,7 +427,7 @@ export const NotesProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     if (!n) return;
     try {
       addLog('info', `Manual AI Analysis: "${n.title}"...`);
-      const res = await ai.analyzeText(n.content, settings);
+      const res = await ai.analyzeText(n.content, settings, notes);
       
       const detectedTags = res.hashtags?.length ? res.hashtags : (res.tags || []);
       const combinedTags = Array.from(new Set([...(n.tags || []), ...detectedTags]));
@@ -542,19 +580,73 @@ export const NotesProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setTelegramMessages(prev => prev.filter(m => m.id !== id));
   };
 
+  // --- Graph Entity Resolution Auto-Merge ---
+  const runGraphAutoMerge = async (): Promise<GraphMergeReport> => {
+    addLog('info', 'Graph Merger: Запуск анализа сущностей и авто-слияния синонимов...');
+    const { updatedNotes, report } = autoMergeGraph(notes, settings.entityResolutionThreshold || 0.85);
+    
+    if (report.totalMerged > 0) {
+      setNotes(updatedNotes);
+      await storage.saveNotes(updatedNotes);
+      addLog('success', `Graph Merger: Объединено ${report.totalMerged} синонимов в ${report.affectedNotesCount} заметках.`);
+    } else {
+      addLog('info', 'Graph Merger: Граф уже оптимизирован, дубликатов не найдено.');
+    }
+    return report;
+  };
+
+  // --- E2EE Encrypted Vault Export / Import ---
+  const exportEncryptedVault = async (passphrase: string) => {
+    try {
+      addLog('info', 'E2EE Vault: Шифрование данных ключом AES-GCM...');
+      await exportEncryptedVaultFile(notes, settings, goals, passphrase);
+      await saveLocalEncryptedSnapshot(notes, passphrase);
+      addLog('success', 'E2EE Vault: Зашифрованный архив успешно сохранен (.smvault).');
+    } catch (e: any) {
+      addLog('error', 'E2EE Vault: Ошибка экспорта', e.message);
+      throw e;
+    }
+  };
+
+  const importEncryptedVault = async (file: File, passphrase: string) => {
+    try {
+      addLog('info', 'E2EE Vault: Расшифровка архива...');
+      const decrypted = await importEncryptedVaultFile(file, passphrase);
+      if (decrypted.notes && Array.isArray(decrypted.notes)) {
+        setNotes(decrypted.notes);
+        await storage.saveNotes(decrypted.notes);
+        if (decrypted.goals) {
+          setGoals(decrypted.goals);
+          await storage.saveGoals(decrypted.goals);
+        }
+        if (decrypted.settings) {
+          setSettings(decrypted.settings);
+          await storage.saveSettings(decrypted.settings);
+        }
+        addLog('success', `E2EE Vault: Успешно восстановлено ${decrypted.notes.length} заметок.`);
+      } else {
+        throw new Error('Архив не содержит валидных заметок.');
+      }
+    } catch (e: any) {
+      addLog('error', 'E2EE Vault: Ошибка импорта', e.message);
+      throw e;
+    }
+  };
+
   const contextValue = React.useMemo(() => ({ 
     notes, goals, settings, profiles, metrics, isLoading, isIndexing, indexingProgress, logs, filterTag, filterCategory, telegramMessages,
     setFilterTag, setFilterCategory, addNote, processLargeText, updateNote, 
     moveToTrash: async (id: string) => setNoteStatus(id, 'trash'), 
     restoreNote: async (id: string) => setNoteStatus(id, 'new'), 
     hardDelete: async (id: string) => { setNotes(prev => { const u = prev.filter(x => x.id !== id); storage.saveNotes(u); return u; }); },
-    setNoteStatus, updateSettings, addLog, runAIAnalysis, reanalyzeAll, autoGroupIdeas,
+    setNoteStatus, updateSettings, addLog, runAIAnalysis, reanalyzeAll, autoGroupIdeas, runGraphAutoMerge,
     runSystemCheck: async () => { addLog('info', 'Ping test...'); const r = await ai.testConnection(settings); r.success ? addLog('success', r.message) : addLog('error', r.message); },
     updateNotePosition: async (id: string, x: number, y: number) => { setNotes(prev => { const u = prev.map(n => n.id === id ? { ...n, position: { x, y } } : n); storage.saveNotes(u); return u; }); },
     updateNoteSize: async (id: string, w: number, h: number) => { setNotes(prev => { const u = prev.map(n => n.id === id ? { ...n, size: { w, h } } : n); storage.saveNotes(u); return u; }); },
     syncTelegram, deleteTelegramMsg, 
     addGoal, updateGoal, toggleGoalStatus, deleteGoal, addCategory, deleteCategory,
-    createProfile, switchProfile, deleteProfile, clearSystemCache: ai.clearCache, triggerBackup, importBackup, exportToMarkdown
+    createProfile, switchProfile, deleteProfile, clearSystemCache: ai.clearCache, triggerBackup, importBackup, exportToMarkdown,
+    exportEncryptedVault, importEncryptedVault
   }), [
     notes, goals, settings, profiles, metrics, isLoading, isIndexing, indexingProgress, logs, filterTag, filterCategory, telegramMessages,
     addNote, processLargeText, updateNote, setNoteStatus, updateSettings, addLog, runAIAnalysis, reanalyzeAll, autoGroupIdeas,
